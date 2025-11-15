@@ -3,6 +3,7 @@ numpy
 matplotlib
 scikit-learn
 lightgbm
+xgboost
 joblib
 pdfplumber
 python-dateutil
@@ -13,3 +14,4 @@ pydantic
 plotly
 holidays
 openpyxl
+requests

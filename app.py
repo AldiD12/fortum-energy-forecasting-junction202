@@ -6,6 +6,7 @@ Forecasts consumption for 112 customer groups
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
 import requests
 import holidays
 from sklearn.metrics import mean_absolute_percentage_error
@@ -208,16 +209,43 @@ def main():
     print(f"✅ Features created: {len(df.columns)} columns")
     
     # ==================
-    # 4. RESHAPE TO LONG
+    # 4. CROSS-GROUP INTERACTION FEATURES
     # ==================
-    print("Reshaping to long format...")
-    
+    print_section("CROSS-GROUP INTERACTIONS")
+
+    # Calculate aggregate consumption by customer type
+    private_groups = df_groups[df_groups['customer_type'] == 'Private']['region_id'].tolist()
+    enterprise_groups = df_groups[df_groups['customer_type'] == 'Enterprise']['region_id'].tolist()
+
+    private_cols = [str(g) for g in private_groups if g in df.columns]
+    enterprise_cols = [str(g) for g in enterprise_groups if g in df.columns]
+
+    if private_cols:
+        df['total_private_consumption'] = df[private_cols].sum(axis=1)
+        df['avg_private_consumption'] = df[private_cols].mean(axis=1)
+        print(f"✅ Private group features: {len(private_cols)} groups")
+
+    if enterprise_cols:
+        df['total_enterprise_consumption'] = df[enterprise_cols].sum(axis=1)
+        df['avg_enterprise_consumption'] = df[enterprise_cols].mean(axis=1)
+        print(f"✅ Enterprise group features: {len(enterprise_cols)} groups")
+
+    # Cross-group ratio (industrial affects residential)
+    if private_cols and enterprise_cols:
+        df['enterprise_to_private_ratio'] = df['total_enterprise_consumption'] / (df['total_private_consumption'] + 1)
+        print("✅ Cross-group ratio feature added")
+
+    # ==================
+    # 5. RESHAPE TO LONG
+    # ==================
+    print_section("RESHAPING TO LONG FORMAT")
+
     # Get group columns that exist
     group_cols = [g for g in CUSTOMER_GROUPS if g in df.columns]
     print(f"Found {len(group_cols)} customer groups in data")
-    
+
     id_vars = [c for c in df.columns if c not in group_cols]
-    
+
     df_long = df.melt(
         id_vars=id_vars,
         value_vars=group_cols,
@@ -245,14 +273,17 @@ def main():
             dummies = pd.get_dummies(df_long[col], prefix=col, drop_first=True)
             df_long = pd.concat([df_long, dummies], axis=1)
     
-    # Lag features per group
-    print("Creating lags...")
+    # Lag features per group - EXTENDED FOR BETTER PERFORMANCE
+    print("Creating extended lags (10 lags + rolling windows)...")
     df_long = df_long.sort_values(['group_id', 'measured_at'])
-    
-    for lag in [1, 24, 168]:
+
+    # Extended lag features: short-term, daily, and weekly patterns
+    lag_periods = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]  # Up to 2 weeks
+    for lag in lag_periods:
         df_long[f'lag_{lag}'] = df_long.groupby('group_id')['consumption'].shift(lag)
-    
-    for window in [24, 168]:
+
+    # Rolling windows for trend detection
+    for window in [24, 48, 168]:
         df_long[f'roll_{window}'] = df_long.groupby('group_id')['consumption'].transform(
             lambda x: x.shift(1).rolling(window, min_periods=1).mean()
         )
@@ -282,30 +313,38 @@ def main():
     
     print(f"Train: {len(X_train):,} | Test: {len(X_test):,}")
     
-    # Train separate models for different customer types (WINNING STRATEGY!)
+    # Train ENSEMBLE models for different customer types (WINNING STRATEGY!)
     models = {}
-    
+
+    # Store all predictions for proper MAPE calculation
+    all_test_preds = []
+    all_test_actuals = []
+
     for customer_type in df_groups['customer_type'].unique():
-        print(f"\nTraining {customer_type} model...")
+        print(f"\n{'='*50}")
+        print(f"Training ENSEMBLE for {customer_type}...")
+        print(f"{'='*50}")
+
         type_groups = df_groups[df_groups['customer_type'] == customer_type]['region_id'].tolist()
         type_data = df_long[df_long['group_id'].isin(type_groups)]
-        
+
         if len(type_data) < 1000:
             continue
-            
+
         # Split for this customer type
         type_split = int(len(type_data) * 0.85)
         X_type_train = type_data.iloc[:type_split][feature_cols]
         y_type_train = type_data.iloc[:type_split]['consumption']
         X_type_test = type_data.iloc[type_split:][feature_cols]
         y_type_test = type_data.iloc[type_split:]['consumption']
-        
-        # Enhanced parameters for competition
-        params = {
+
+        # --- MODEL 1: LightGBM ---
+        print(f"  Training LightGBM...")
+        lgb_params = {
             'objective': 'regression',
             'metric': 'mape',
-            'num_leaves': 63,  # Increased complexity
-            'learning_rate': 0.03,  # Lower for better convergence
+            'num_leaves': 63,
+            'learning_rate': 0.03,
             'feature_fraction': 0.8,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
@@ -314,25 +353,73 @@ def main():
             'reg_lambda': 0.1,
             'verbose': -1
         }
-        
+
         lgb_train = lgb.Dataset(X_type_train, y_type_train)
         lgb_eval = lgb.Dataset(X_type_test, y_type_test, reference=lgb_train)
-        
-        model = lgb.train(
-            params, lgb_train, num_boost_round=500,
+
+        lgb_model = lgb.train(
+            lgb_params, lgb_train, num_boost_round=500,
             valid_sets=[lgb_eval],
             callbacks=[lgb.early_stopping(50, verbose=False)]
         )
-        
-        models[customer_type] = model
-        
-        type_pred = model.predict(X_type_test)
-        type_mape = np.mean(np.abs((y_type_test - type_pred) / y_type_test)) * 100
-        print(f"{customer_type} MAPE: {type_mape:.2f}%")
-    
-    y_pred = model.predict(X_test)
-    mape = mean_absolute_percentage_error(y_test, y_pred) * 100
-    print(f"\n✅ MAPE: {mape:.2f}%")
+
+        # --- MODEL 2: XGBoost ---
+        print(f"  Training XGBoost...")
+        xgb_params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'mape',
+            'max_depth': 6,
+            'learning_rate': 0.03,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': 0.1,
+            'reg_lambda': 0.1,
+            'verbosity': 0
+        }
+
+        xgb_train = xgb.DMatrix(X_type_train, label=y_type_train)
+        xgb_eval = xgb.DMatrix(X_type_test, label=y_type_test)
+
+        xgb_model = xgb.train(
+            xgb_params, xgb_train, num_boost_round=500,
+            evals=[(xgb_eval, 'eval')],
+            early_stopping_rounds=50,
+            verbose_eval=False
+        )
+
+        # Store both models as ensemble
+        models[customer_type] = {
+            'lgb': lgb_model,
+            'xgb': xgb_model
+        }
+
+        # Calculate ensemble predictions (weighted average)
+        lgb_pred = lgb_model.predict(X_type_test)
+        xgb_pred = xgb_model.predict(xgb.DMatrix(X_type_test))
+
+        # Ensemble: 60% LightGBM + 40% XGBoost (LightGBM typically performs better on this data)
+        ensemble_pred = 0.6 * lgb_pred + 0.4 * xgb_pred
+
+        # Calculate MAPE for ensemble
+        lgb_mape = np.mean(np.abs((y_type_test - lgb_pred) / y_type_test)) * 100
+        xgb_mape = np.mean(np.abs((y_type_test - xgb_pred) / y_type_test)) * 100
+        ensemble_mape = np.mean(np.abs((y_type_test - ensemble_pred) / y_type_test)) * 100
+
+        print(f"  LightGBM MAPE: {lgb_mape:.2f}%")
+        print(f"  XGBoost MAPE: {xgb_mape:.2f}%")
+        print(f"  ✅ Ensemble MAPE: {ensemble_mape:.2f}%")
+
+        # Store ensemble predictions for overall MAPE calculation
+        all_test_preds.extend(ensemble_pred.tolist())
+        all_test_actuals.extend(y_type_test.tolist())
+
+    # Calculate OVERALL MAPE correctly (weighted by all customer types)
+    if all_test_preds:
+        overall_mape = np.mean(np.abs((np.array(all_test_actuals) - np.array(all_test_preds)) / np.array(all_test_actuals))) * 100
+        print(f"\n✅ Overall MAPE (all customer types): {overall_mape:.2f}%")
+    else:
+        overall_mape = 0.0
+        print("\n⚠️  No predictions made")
     
     # ==================
     # 7. HOURLY FORECAST (48 hours)
@@ -360,65 +447,97 @@ def main():
         future_df['windspeed'] = 5
     
     future_df = create_features(future_df)
-    
-    # Predict for each group using appropriate model
+
+    # Add cross-group features to future predictions (use last known values)
+    if 'total_private_consumption' in df.columns:
+        future_df['total_private_consumption'] = df['total_private_consumption'].iloc[-1]
+        future_df['avg_private_consumption'] = df['avg_private_consumption'].iloc[-1]
+    if 'total_enterprise_consumption' in df.columns:
+        future_df['total_enterprise_consumption'] = df['total_enterprise_consumption'].iloc[-1]
+        future_df['avg_enterprise_consumption'] = df['avg_enterprise_consumption'].iloc[-1]
+    if 'enterprise_to_private_ratio' in df.columns:
+        future_df['enterprise_to_private_ratio'] = df['enterprise_to_private_ratio'].iloc[-1]
+
+    # Predict for each group using appropriate model with AUTOREGRESSIVE LAG UPDATING
     hourly_preds = {}
-    
+
     for group_id in CUSTOMER_GROUPS:
         # Get customer type for this group
         group_info = df_groups[df_groups['region_id'] == group_id]
         if group_info.empty:
             hourly_preds[str(group_id)] = [1000] * 48
             continue
-            
+
         customer_type = group_info['customer_type'].iloc[0]
-        
-        # Use appropriate model
+
+        # Use appropriate ensemble models
         if customer_type in models:
-            model = models[customer_type]
+            ensemble = models[customer_type]
+            lgb_model = ensemble['lgb']
+            xgb_model = ensemble['xgb']
         else:
-            # Fallback to first available model
-            model = list(models.values())[0]
-        
+            # Fallback to first available ensemble
+            ensemble = list(models.values())[0]
+            lgb_model = ensemble['lgb']
+            xgb_model = ensemble['xgb']
+
         # Get last values for this group
         last_vals = df_long[df_long['group_id'] == group_id].tail(200)
-        
+
         if len(last_vals) == 0:
             hourly_preds[str(group_id)] = [1000] * 48
             continue
-        
-        # Create features for this group
-        group_future = future_df.copy()
-        
-        # Add group features
-        group_info = df_groups[df_groups['region_id'] == group_id]
-        if not group_info.empty:
-            for col in ['customer_type', 'contract_type', 'consumption_level']:
-                if col in group_info.columns:
-                    val = group_info[col].values[0]
-                    # Add dummy features
-                    for cat in df_long[col].unique():
-                        if cat != val:  # drop_first
-                            group_future[f'{col}_{cat}'] = 0
-                        else:
-                            if f'{col}_{cat}' in feature_cols:
-                                group_future[f'{col}_{cat}'] = 1
-        
-        # Add lags
-        group_future['lag_1'] = last_vals['consumption'].iloc[-1] if len(last_vals) >= 1 else last_vals['consumption'].mean()
-        group_future['lag_24'] = last_vals['consumption'].iloc[-24] if len(last_vals) >= 24 else last_vals['consumption'].mean()
-        group_future['lag_168'] = last_vals['consumption'].iloc[-168] if len(last_vals) >= 168 else last_vals['consumption'].mean()
-        group_future['roll_24'] = last_vals['consumption'].tail(24).mean()
-        group_future['roll_168'] = last_vals['consumption'].tail(168).mean()
-        
-        # Fill missing features
-        for col in feature_cols:
-            if col not in group_future.columns:
-                group_future[col] = 0
-        
-        # Predict using the customer-type specific model
-        preds = model.predict(group_future[feature_cols])
-        hourly_preds[str(group_id)] = preds.tolist()
+
+        # AUTOREGRESSIVE PREDICTION - Update lags dynamically
+        group_predictions = []
+        history = last_vals['consumption'].tolist()  # Keep history for lag calculations
+
+        for hour_idx in range(48):
+            # Create features for THIS SPECIFIC HOUR
+            hour_features = future_df.iloc[hour_idx:hour_idx+1].copy()
+
+            # Add group features
+            if not group_info.empty:
+                for col in ['customer_type', 'contract_type', 'consumption_level']:
+                    if col in group_info.columns:
+                        val = group_info[col].values[0]
+                        # Add dummy features
+                        for cat in df_long[col].unique():
+                            if cat != val:  # drop_first
+                                hour_features[f'{col}_{cat}'] = 0
+                            else:
+                                if f'{col}_{cat}' in feature_cols:
+                                    hour_features[f'{col}_{cat}'] = 1
+
+            # DYNAMIC LAG UPDATES - Use most recent history including predictions
+            # Extended lags: 1, 2, 3, 6, 12, 24, 48, 72, 168, 336
+            lag_periods = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]
+            for lag in lag_periods:
+                hour_features[f'lag_{lag}'] = history[-lag] if len(history) >= lag else last_vals['consumption'].mean()
+
+            # Rolling windows
+            for window in [24, 48, 168]:
+                hour_features[f'roll_{window}'] = np.mean(history[-window:]) if len(history) >= window else last_vals['consumption'].mean()
+
+            # Fill missing features
+            for col in feature_cols:
+                if col not in hour_features.columns:
+                    hour_features[col] = 0
+
+            # Predict for this hour using ENSEMBLE
+            lgb_pred = lgb_model.predict(hour_features[feature_cols])[0]
+            xgb_pred = xgb_model.predict(xgb.DMatrix(hour_features[feature_cols]))[0]
+
+            # Ensemble: 60% LightGBM + 40% XGBoost
+            pred = 0.6 * lgb_pred + 0.4 * xgb_pred
+            group_predictions.append(pred)
+
+            # UPDATE HISTORY with prediction for next iteration
+            history.append(pred)
+            if len(history) > 200:  # Keep history manageable
+                history.pop(0)
+
+        hourly_preds[str(group_id)] = group_predictions
     
     # Create submission
     hourly_sub = pd.DataFrame(hourly_preds)
@@ -430,26 +549,56 @@ def main():
     # 8. MONTHLY FORECAST (12 months)
     # ==================
     print_section("MONTHLY PREDICTIONS")
-    
+
     future_months = pd.date_range(start='2024-10-01', periods=12, freq='MS')
-    
-    # Simple approach: average hourly * hours in month
-    monthly_avg = hourly_sub.drop('measured_at', axis=1).mean()
-    
+
+    # IMPROVED: Use seasonal patterns from historical data instead of random
+    print("Calculating seasonal monthly patterns from historical data...")
+
+    # Get monthly aggregates from historical data
+    df_monthly = df.copy()
+    df_monthly['year_month'] = df_monthly['measured_at'].dt.to_period('M')
+
     monthly_preds = {}
     for group_id in CUSTOMER_GROUPS:
         col = str(group_id)
-        if col in monthly_avg.index:
-            # Scale up to monthly (avg ~730 hours/month)
-            base = monthly_avg[col] * 730
-            # Add variation
-            monthly_preds[col] = [base * (0.9 + np.random.rand() * 0.2) for _ in range(12)]
+
+        if col in df.columns:
+            # Calculate monthly totals for each month in history
+            monthly_totals = df_monthly.groupby('year_month')[col].sum()
+
+            # Calculate seasonal factors by calendar month
+            df_monthly['month'] = df_monthly['measured_at'].dt.month
+            seasonal_factors = df_monthly.groupby('month')[col].sum() / df_monthly.groupby('month')[col].sum().mean()
+
+            # Get base consumption from recent hourly predictions
+            if col in hourly_sub.columns:
+                base_hourly = hourly_sub[col].mean()
+            else:
+                base_hourly = monthly_totals.mean() / 730
+
+            # Generate 12 monthly predictions with seasonal adjustment
+            predictions = []
+            for i, future_date in enumerate(future_months):
+                month = future_date.month
+                days_in_month = pd.Period(future_date, freq='M').days_in_month
+                hours_in_month = days_in_month * 24
+
+                # Apply seasonal factor if available
+                seasonal_factor = seasonal_factors.get(month, 1.0)
+
+                # Monthly prediction = hourly average × hours in month × seasonal factor
+                monthly_pred = base_hourly * hours_in_month * seasonal_factor
+                predictions.append(monthly_pred)
+
+            monthly_preds[col] = predictions
         else:
-            monthly_preds[col] = [1000] * 12
-    
+            # Fallback for missing groups
+            monthly_preds[col] = [1000 * 730] * 12
+
     monthly_sub = pd.DataFrame(monthly_preds)
     monthly_sub.insert(0, 'measured_at', future_months.strftime('%Y-%m-%dT%H:%M:%S.000Z'))
-    
+
     print(f"✅ Monthly: {monthly_sub.shape}")
     
     # ==================
@@ -464,9 +613,9 @@ def main():
     print(f"✅ {CONFIG['output_monthly']}")
     
     print_section("COMPLETE!")
-    print(f"Model MAPE: {mape:.2f}%")
-    
-    return model, mape
+    print(f"Overall Model MAPE: {overall_mape:.2f}%")
+
+    return models, overall_mape
 
 if __name__ == "__main__":
-    model, mape = main()
+    models, overall_mape = main()
