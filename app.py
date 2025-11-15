@@ -304,14 +304,14 @@ def main():
     feature_cols = [c for c in df_long.columns if c not in exclude and df_long[c].dtype in [np.float64, np.int64]]
     print(f"Features: {len(feature_cols)}")
     
-    # Split
-    split = int(len(df_long) * 0.85)
+    # Split - 90/10 for maximum training data
+    split = int(len(df_long) * 0.90)
     X_train = df_long.iloc[:split][feature_cols]
     y_train = df_long.iloc[:split]['consumption']
     X_test = df_long.iloc[split:][feature_cols]
     y_test = df_long.iloc[split:]['consumption']
-    
-    print(f"Train: {len(X_train):,} | Test: {len(X_test):,}")
+
+    print(f"Train (90%): {len(X_train):,} | Test (10%): {len(X_test):,}")
     
     # Train ENSEMBLE models for different customer types (WINNING STRATEGY!)
     models = {}
@@ -331,8 +331,8 @@ def main():
         if len(type_data) < 1000:
             continue
 
-        # Split for this customer type
-        type_split = int(len(type_data) * 0.85)
+        # Split for this customer type - 90/10 for maximum training data
+        type_split = int(len(type_data) * 0.90)
         X_type_train = type_data.iloc[:type_split][feature_cols]
         y_type_train = type_data.iloc[:type_split]['consumption']
         X_type_test = type_data.iloc[type_split:][feature_cols]
