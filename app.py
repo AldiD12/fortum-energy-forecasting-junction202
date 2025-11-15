@@ -23,6 +23,9 @@ CONFIG = {
     'sheet_groups': 'groups',
     'output_hourly': 'submission_hourly.csv',
     'output_monthly': 'submission_monthly.csv',
+    'train_end_date': '2024-07-31',  # Train only up to this date
+    'test_start_date': '2024-08-01',  # Start predictions from here
+    'test_end_date': '2024-09-30',  # End predictions here
 }
 
 # 112 customer group IDs
@@ -339,28 +342,37 @@ def main():
     
     df_long = df_long.dropna(subset=['lag_1'])
     print(f"✅ After lags: {df_long.shape}")
-    
+
     # ==================
-    # 6. TRAIN MODEL
+    # 6. TRAIN MODEL (Proper Train/Test Split by DATE)
     # ==================
     print_section("TRAINING MODEL")
-    
+
     # Features
-    exclude = ['measured_at', 'consumption', 'group_id', 'region_id', 
+    exclude = ['measured_at', 'consumption', 'group_id', 'region_id',
                'region_name', 'subregion', 'macro_region',
                'customer_type', 'contract_type', 'consumption_level']
-    
+
     feature_cols = [c for c in df_long.columns if c not in exclude and df_long[c].dtype in [np.float64, np.int64]]
     print(f"Features: {len(feature_cols)}")
-    
-    # Split - 90/10 for maximum training data
-    split = int(len(df_long) * 0.90)
-    X_train = df_long.iloc[:split][feature_cols]
-    y_train = df_long.iloc[:split]['consumption']
-    X_test = df_long.iloc[split:][feature_cols]
-    y_test = df_long.iloc[split:]['consumption']
 
-    print(f"Train (90%): {len(X_train):,} | Test (10%): {len(X_test):,}")
+    # PROPER DATE-BASED SPLIT (No data leakage!)
+    train_end = pd.to_datetime(CONFIG['train_end_date'])
+    test_start = pd.to_datetime(CONFIG['test_start_date'])
+    test_end = pd.to_datetime(CONFIG['test_end_date'])
+
+    # Train on data up to July 31, 2024
+    train_mask = df_long['measured_at'] <= train_end
+    # Test on August 1 - September 30, 2024
+    test_mask = (df_long['measured_at'] >= test_start) & (df_long['measured_at'] <= test_end)
+
+    X_train = df_long[train_mask][feature_cols]
+    y_train = df_long[train_mask]['consumption']
+    X_test = df_long[test_mask][feature_cols]
+    y_test = df_long[test_mask]['consumption']
+
+    print(f"Train (up to {CONFIG['train_end_date']}): {len(X_train):,} samples")
+    print(f"Test ({CONFIG['test_start_date']} to {CONFIG['test_end_date']}): {len(X_test):,} samples")
     
     # Train LightGBM models for different customer types (OPTIMIZED FOR SPEED!)
     models = {}
@@ -380,12 +392,14 @@ def main():
         if len(type_data) < 1000:
             continue
 
-        # Split for this customer type - 90/10 for maximum training data
-        type_split = int(len(type_data) * 0.90)
-        X_type_train = type_data.iloc[:type_split][feature_cols]
-        y_type_train = type_data.iloc[:type_split]['consumption']
-        X_type_test = type_data.iloc[type_split:][feature_cols]
-        y_type_test = type_data.iloc[type_split:]['consumption']
+        # DATE-BASED split for this customer type (no data leakage!)
+        type_train_mask = type_data['measured_at'] <= train_end
+        type_test_mask = (type_data['measured_at'] >= test_start) & (type_data['measured_at'] <= test_end)
+
+        X_type_train = type_data[type_train_mask][feature_cols]
+        y_type_train = type_data[type_train_mask]['consumption']
+        X_type_test = type_data[type_test_mask][feature_cols]
+        y_type_test = type_data[type_test_mask]['consumption']
 
         # LightGBM Model
         print(f"  Training LightGBM...")
@@ -456,29 +470,24 @@ def main():
         print("\n⚠️  No predictions made")
     
     # ==================
-    # 7. HOURLY FORECAST (48 hours)
+    # 7. TEST PERIOD PREDICTIONS (August-September 2024)
     # ==================
-    print_section("HOURLY PREDICTIONS")
-    
-    last_time = df['measured_at'].max()
-    future_hours = pd.date_range(start=last_time + timedelta(hours=1), periods=48, freq='H')
+    print_section("TEST PERIOD PREDICTIONS")
 
-    # Create future dataframe with weather forecasts/estimates
-    future_df = pd.DataFrame({'measured_at': future_hours})
+    # Get test period data (August 1 - September 30, 2024)
+    test_start_dt = pd.to_datetime(CONFIG['test_start_date'])
+    test_end_dt = pd.to_datetime(CONFIG['test_end_date'])
 
-    # Use recent average weather as baseline forecast (simple but effective)
-    recent_weather = df.tail(168)  # Last week
-    for col in ['avg_temp', 'max_temp', 'min_temp', 'humidity', 'wind_speed',
-                'wind_direction', 'precipitation', 'air_pressure', 'eur_per_mwh']:
-        if col in df.columns:
-            # Use hour-of-day average from last week for better forecasts
-            hour_avgs = recent_weather.groupby(recent_weather['measured_at'].dt.hour)[col].mean()
-            future_df[col] = future_df['measured_at'].dt.hour.map(hour_avgs)
-            # Fill any missing with overall average
-            future_df[col] = future_df[col].fillna(recent_weather[col].mean())
+    # Filter df to get test period (we have actual weather for this!)
+    test_period_mask = (df['measured_at'] >= test_start_dt) & (df['measured_at'] <= test_end_dt)
+    future_df = df[test_period_mask][['measured_at', 'avg_temp', 'max_temp', 'min_temp', 'humidity',
+                                       'wind_speed', 'wind_direction', 'precipitation', 'air_pressure',
+                                       'eur_per_mwh']].copy()
 
-    print(f"✅ Future weather estimated from recent patterns (last 168 hours)")
+    print(f"✅ Test period: {test_start_dt.date()} to {test_end_dt.date()}")
+    print(f"✅ Total hours to predict: {len(future_df)}")
 
+    # Create features for test period
     future_df = create_features(future_df)
 
     # Add cross-group features to future predictions (use last known values)
@@ -495,6 +504,7 @@ def main():
     hourly_preds = {}
 
     print(f"Generating predictions for {len(CUSTOMER_GROUPS)} customer groups...")
+    print(f"Predicting {len(future_df)} hours for each group...")
 
     for idx, group_id in enumerate(CUSTOMER_GROUPS):
         if (idx + 1) % 20 == 0 or (idx + 1) == len(CUSTOMER_GROUPS):
@@ -503,7 +513,7 @@ def main():
         # Get customer type for this group
         group_info = df_groups[df_groups['region_id'] == group_id]
         if group_info.empty:
-            hourly_preds[str(group_id)] = [1000] * 48
+            hourly_preds[str(group_id)] = [0] * len(future_df)
             continue
 
         customer_type = group_info['customer_type'].iloc[0]
@@ -515,11 +525,11 @@ def main():
             # Fallback to first available model
             model = list(models.values())[0]
 
-        # Get last values for this group
-        last_vals = df_long[df_long['group_id'] == group_id].tail(200)
+        # Get last values BEFORE test period (NO DATA LEAKAGE!)
+        last_vals = df_long[(df_long['group_id'] == group_id) & (df_long['measured_at'] <= train_end)].tail(200)
 
         if len(last_vals) == 0:
-            hourly_preds[str(group_id)] = [1000] * 48
+            hourly_preds[str(group_id)] = [0] * len(future_df)
             continue
 
         # PRE-CALCULATE group features once (MUCH FASTER!)
@@ -538,13 +548,14 @@ def main():
 
         # AUTOREGRESSIVE PREDICTION - Update lags dynamically
         group_predictions = []
-        history = last_vals['consumption'].tolist()  # Keep history for lag calculations
+        history = last_vals['consumption'].tolist()  # Keep history for lag calculations from BEFORE test period
 
         # Prepare lag periods once
         lag_periods = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]
         window_periods = [24, 48, 168]
 
-        for hour_idx in range(48):
+        # Predict for ALL hours in test period
+        for hour_idx in range(len(future_df)):
             # Start with future weather/time features for this hour
             hour_features = future_df.iloc[hour_idx].to_dict()
 
@@ -580,11 +591,12 @@ def main():
 
     print(f"✅ Completed all {len(CUSTOMER_GROUPS)} groups!")
 
-    # Create submission
+    # Create submission with actual test period timestamps
     hourly_sub = pd.DataFrame(hourly_preds)
-    hourly_sub.insert(0, 'measured_at', future_hours.strftime('%Y-%m-%dT%H:%M:%S.000Z'))
+    hourly_sub.insert(0, 'measured_at', future_df['measured_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.000Z'))
 
-    print(f"✅ Hourly predictions generated: {hourly_sub.shape}")
+    print(f"✅ Test period predictions generated: {hourly_sub.shape}")
+    print(f"   Period: {future_df['measured_at'].min()} to {future_df['measured_at'].max()}")
     
     # ==================
     # 8. MONTHLY FORECAST (12 months)
