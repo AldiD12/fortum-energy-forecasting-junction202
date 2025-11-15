@@ -19,12 +19,11 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 CONFIG = {
-    'train_file': '20251111_JUNCTION_training.xlsx',
-    'sheet_consumption': 'training_consumption',
+    'combined_data': 'combined_data.csv',  # Combined weather + consumption + price data
+    'train_file': '20251111_JUNCTION_training.xlsx',  # Still need for groups metadata
     'sheet_groups': 'groups',
     'output_hourly': 'submission_hourly.csv',
     'output_monthly': 'submission_monthly.csv',
-    'use_weather': True,
 }
 
 # 112 customer group IDs
@@ -121,39 +120,81 @@ def get_forecast(days=7):
         return None
 
 def create_features(df):
-    """Create time and weather features"""
+    """Create time and enhanced weather features"""
     df = df.copy()
-    
+
     # Time features
     df['hour'] = df['measured_at'].dt.hour
     df['dayofweek'] = df['measured_at'].dt.dayofweek
     df['month'] = df['measured_at'].dt.month
     df['dayofyear'] = df['measured_at'].dt.dayofyear
-    
-    # Cyclical
+
+    # Cyclical encoding
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-    
+
     # Calendar
     years = df['measured_at'].dt.year.unique()
     fi_holidays = holidays.Finland(years=years)
     df['is_holiday'] = df['measured_at'].dt.date.apply(lambda x: x in fi_holidays).astype(int)
     df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
-    
-    # Weather + Advanced interactions
-    if 'temperature' in df.columns:
-        df['is_cold'] = (df['temperature'] < -5).astype(int)
-        df['heating_degree'] = np.maximum(17 - df['temperature'], 0)
-        df['temp_hour_interaction'] = df['temperature'] * df['hour']
-        df['temp_weekend_interaction'] = df['temperature'] * df['is_weekend']
-    
+
+    # ENHANCED WEATHER FEATURES (from combined_data.csv)
+    if 'avg_temp' in df.columns:
+        # Temperature range (daily variation)
+        if 'max_temp' in df.columns and 'min_temp' in df.columns:
+            df['temp_range'] = df['max_temp'] - df['min_temp']
+            df['temp_range_high'] = (df['temp_range'] > 10).astype(int)  # High variation day
+
+        # Heating/cooling needs
+        df['is_cold'] = (df['avg_temp'] < -5).astype(int)
+        df['is_hot'] = (df['avg_temp'] > 25).astype(int)
+        df['heating_degree'] = np.maximum(17 - df['avg_temp'], 0)
+        df['cooling_degree'] = np.maximum(df['avg_temp'] - 24, 0)
+
+        # Temperature interactions
+        df['temp_hour_interaction'] = df['avg_temp'] * df['hour']
+        df['temp_weekend_interaction'] = df['avg_temp'] * df['is_weekend']
+
+    # Wind features
+    if 'wind_speed' in df.columns:
+        df['is_windy'] = (df['wind_speed'] > 8).astype(int)
+        df['wind_chill_effect'] = df['wind_speed'] * (df['avg_temp'] if 'avg_temp' in df.columns else 0)
+
+        # Wind direction categories (N, E, S, W)
+        if 'wind_direction' in df.columns:
+            df['wind_north'] = ((df['wind_direction'] >= 315) | (df['wind_direction'] < 45)).astype(int)
+            df['wind_east'] = ((df['wind_direction'] >= 45) & (df['wind_direction'] < 135)).astype(int)
+            df['wind_south'] = ((df['wind_direction'] >= 135) & (df['wind_direction'] < 225)).astype(int)
+            df['wind_west'] = ((df['wind_direction'] >= 225) & (df['wind_direction'] < 315)).astype(int)
+
+    # Air pressure (weather stability indicator)
+    if 'air_pressure' in df.columns:
+        df['pressure_high'] = (df['air_pressure'] > 1020).astype(int)  # High pressure = stable weather
+        df['pressure_low'] = (df['air_pressure'] < 1000).astype(int)   # Low pressure = stormy
+        df['pressure_change'] = df['air_pressure'].diff().fillna(0)     # Rapid changes affect consumption
+
+    # Precipitation
+    if 'precipitation' in df.columns:
+        df['is_raining'] = (df['precipitation'] > 0.1).astype(int)
+        df['heavy_rain'] = (df['precipitation'] > 5).astype(int)
+
+    # Humidity
+    if 'humidity' in df.columns:
+        df['is_humid'] = (df['humidity'] > 80).astype(int)
+        df['is_dry'] = (df['humidity'] < 40).astype(int)
+
     # Price interactions (WINNING FEATURES!)
     if 'eur_per_mwh' in df.columns:
         df['price_hour_interaction'] = df['eur_per_mwh'] * df['hour']
         df['price_weekend_interaction'] = df['eur_per_mwh'] * df['is_weekend']
-    
+
+        # Price-temperature interaction (expensive heating days)
+        if 'avg_temp' in df.columns:
+            df['price_temp_interaction'] = df['eur_per_mwh'] * df['heating_degree']
+
     return df
 
 # ============================================================================
@@ -164,42 +205,51 @@ def main():
     print_section("FORTUM JUNCTION 2025")
     
     # ==================
-    # 1. LOAD DATA
+    # 1. LOAD COMBINED DATA (Weather + Consumption + Prices)
     # ==================
-    print_section("LOADING DATA")
-    
-    df = pd.read_excel(CONFIG['train_file'], sheet_name=CONFIG['sheet_consumption'])
-    df_groups = pd.read_excel(CONFIG['train_file'], sheet_name=CONFIG['sheet_groups'])
-    df_prices = pd.read_excel(CONFIG['train_file'], sheet_name='training_prices')
-    
+    print_section("LOADING COMBINED DATA")
+
+    # Load combined CSV with all data
+    df = pd.read_csv(CONFIG['combined_data'])
+
+    # Rename columns to standardized names
+    column_mapping = {
+        'timestamp': 'measured_at',
+        'Average temperature [°C]': 'avg_temp',
+        'Maximum temperature [°C]': 'max_temp',
+        'Minimum temperature [°C]': 'min_temp',
+        'Average relative humidity [%]': 'humidity',
+        'Wind speed [m/s]': 'wind_speed',
+        'Average wind direction [°]': 'wind_direction',
+        'Precipitation [mm]': 'precipitation',
+        'Average air pressure [hPa]': 'air_pressure',
+    }
+    df = df.rename(columns=column_mapping)
+
+    # Parse timestamp
     df['measured_at'] = pd.to_datetime(df['measured_at'])
     df = df.sort_values('measured_at').reset_index(drop=True)
-    
-    print(f"✅ Training data: {df.shape}")
+
+    print(f"✅ Combined data loaded: {df.shape}")
     print(f"   Date range: {df['measured_at'].min()} to {df['measured_at'].max()}")
-    print(f"✅ Groups: {df_groups.shape}")
-    
+    print(f"   Weather features: avg_temp, max_temp, min_temp, humidity, wind_speed, wind_direction, precipitation, air_pressure")
+    print(f"   Price feature: eur_per_mwh")
+    print(f"   Customer groups: {len([c for c in df.columns if c.isdigit()])}")
+
+    # Load customer group metadata
+    df_groups = pd.read_excel(CONFIG['train_file'], sheet_name=CONFIG['sheet_groups'])
+    print(f"✅ Groups metadata: {df_groups.shape}")
+
     # ==================
-    # 2. WEATHER
+    # 2. PRICE FEATURES (from combined data)
     # ==================
-    if CONFIG['use_weather']:
-        print_section("WEATHER DATA")
-        weather = get_weather(df['measured_at'].min(), df['measured_at'].max())
-        # Fix timezone issues before merging
-        df['measured_at'] = pd.to_datetime(df['measured_at']).dt.tz_localize(None)
-        weather['measured_at'] = pd.to_datetime(weather['measured_at']).dt.tz_localize(None)
-        df = df.merge(weather, on='measured_at', how='left')
-        for col in ['temperature', 'humidity', 'precipitation', 'windspeed']:
-            df[col] = df[col].fillna(method='ffill').fillna(5)
-        print("✅ Weather integrated")
-    
-    # Add electricity prices (CRITICAL FEATURE!)
-    df_prices['measured_at'] = pd.to_datetime(df_prices['measured_at']).dt.tz_localize(None)
-    df = df.merge(df_prices, on='measured_at', how='left')
+    print_section("PRICE FEATURES")
+
     df['price_ma_24'] = df['eur_per_mwh'].rolling(24).mean()
     df['price_volatility'] = df['eur_per_mwh'].rolling(24).std()
     df['price_trend'] = df['eur_per_mwh'].diff(24)
-    print("✅ Price features integrated")
+    df['price_ma_168'] = df['eur_per_mwh'].rolling(168).mean()  # Weekly average
+    print("✅ Price features created (ma_24, volatility, trend, ma_168)")
     
     # ==================
     # 3. FEATURES
@@ -428,24 +478,23 @@ def main():
     
     last_time = df['measured_at'].max()
     future_hours = pd.date_range(start=last_time + timedelta(hours=1), periods=48, freq='H')
-    
-    # Get forecast weather
-    forecast_weather = get_forecast(3)
-    
+
+    # Create future dataframe with weather forecasts/estimates
     future_df = pd.DataFrame({'measured_at': future_hours})
-    if forecast_weather is not None:
-        # Fix timezone issues before merging
-        future_df['measured_at'] = pd.to_datetime(future_df['measured_at']).dt.tz_localize(None)
-        forecast_weather['measured_at'] = pd.to_datetime(forecast_weather['measured_at']).dt.tz_localize(None)
-        future_df = future_df.merge(forecast_weather, on='measured_at', how='left')
-        for col in ['temperature', 'humidity', 'precipitation', 'windspeed']:
-            future_df[col] = future_df[col].fillna(5)
-    else:
-        future_df['temperature'] = 5
-        future_df['humidity'] = 70
-        future_df['precipitation'] = 0
-        future_df['windspeed'] = 5
-    
+
+    # Use recent average weather as baseline forecast (simple but effective)
+    recent_weather = df.tail(168)  # Last week
+    for col in ['avg_temp', 'max_temp', 'min_temp', 'humidity', 'wind_speed',
+                'wind_direction', 'precipitation', 'air_pressure', 'eur_per_mwh']:
+        if col in df.columns:
+            # Use hour-of-day average from last week for better forecasts
+            hour_avgs = recent_weather.groupby(recent_weather['measured_at'].dt.hour)[col].mean()
+            future_df[col] = future_df['measured_at'].dt.hour.map(hour_avgs)
+            # Fill any missing with overall average
+            future_df[col] = future_df[col].fillna(recent_weather[col].mean())
+
+    print(f"✅ Future weather estimated from recent patterns (last 168 hours)")
+
     future_df = create_features(future_df)
 
     # Add cross-group features to future predictions (use last known values)
