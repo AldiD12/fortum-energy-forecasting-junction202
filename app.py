@@ -450,10 +450,19 @@ def main():
         # Ensemble: 60% LightGBM + 40% XGBoost (LightGBM typically performs better on this data)
         ensemble_pred = 0.6 * lgb_pred + 0.4 * xgb_pred
 
-        # Calculate MAPE for ensemble
-        lgb_mape = np.mean(np.abs((y_type_test - lgb_pred) / y_type_test)) * 100
-        xgb_mape = np.mean(np.abs((y_type_test - xgb_pred) / y_type_test)) * 100
-        ensemble_mape = np.mean(np.abs((y_type_test - ensemble_pred) / y_type_test)) * 100
+        # Calculate MAPE for ensemble (filter zeros to avoid NaN)
+        mask = y_type_test > 0.01
+        y_test_filtered = y_type_test[mask]
+        lgb_pred_filtered = lgb_pred[mask]
+        xgb_pred_filtered = xgb_pred[mask]
+        ensemble_pred_filtered = ensemble_pred[mask]
+
+        if len(y_test_filtered) > 0:
+            lgb_mape = np.mean(np.abs((y_test_filtered - lgb_pred_filtered) / y_test_filtered)) * 100
+            xgb_mape = np.mean(np.abs((y_test_filtered - xgb_pred_filtered) / y_test_filtered)) * 100
+            ensemble_mape = np.mean(np.abs((y_test_filtered - ensemble_pred_filtered) / y_test_filtered)) * 100
+        else:
+            lgb_mape = xgb_mape = ensemble_mape = 0.0
 
         print(f"  LightGBM MAPE: {lgb_mape:.2f}%")
         print(f"  XGBoost MAPE: {xgb_mape:.2f}%")
@@ -465,8 +474,22 @@ def main():
 
     # Calculate OVERALL MAPE correctly (weighted by all customer types)
     if all_test_preds:
-        overall_mape = np.mean(np.abs((np.array(all_test_actuals) - np.array(all_test_preds)) / np.array(all_test_actuals))) * 100
-        print(f"\n✅ Overall MAPE (all customer types): {overall_mape:.2f}%")
+        # Convert to arrays
+        actuals = np.array(all_test_actuals)
+        preds = np.array(all_test_preds)
+
+        # Filter out zeros and very small values to avoid division by zero
+        mask = actuals > 0.01  # Only include samples where actual > 0.01
+        filtered_actuals = actuals[mask]
+        filtered_preds = preds[mask]
+
+        if len(filtered_actuals) > 0:
+            overall_mape = np.mean(np.abs((filtered_actuals - filtered_preds) / filtered_actuals)) * 100
+            print(f"\n✅ Overall MAPE (all customer types): {overall_mape:.2f}%")
+            print(f"   (Calculated on {len(filtered_actuals):,} samples, filtered {len(actuals) - len(filtered_actuals):,} near-zero values)")
+        else:
+            overall_mape = 0.0
+            print("\n⚠️  All actual values near zero")
     else:
         overall_mape = 0.0
         print("\n⚠️  No predictions made")
@@ -510,7 +533,10 @@ def main():
     # Predict for each group using appropriate model with AUTOREGRESSIVE LAG UPDATING
     hourly_preds = {}
 
-    for group_id in CUSTOMER_GROUPS:
+    print(f"Generating predictions for {len(CUSTOMER_GROUPS)} customer groups...")
+    for idx, group_id in enumerate(CUSTOMER_GROUPS):
+        if (idx + 1) % 20 == 0 or (idx + 1) == len(CUSTOMER_GROUPS):
+            print(f"  Progress: {idx + 1}/{len(CUSTOMER_GROUPS)} groups completed...")
         # Get customer type for this group
         group_info = df_groups[df_groups['region_id'] == group_id]
         if group_info.empty:
@@ -587,12 +613,14 @@ def main():
                 history.pop(0)
 
         hourly_preds[str(group_id)] = group_predictions
-    
+
+    print(f"✅ Completed all {len(CUSTOMER_GROUPS)} groups!")
+
     # Create submission
     hourly_sub = pd.DataFrame(hourly_preds)
     hourly_sub.insert(0, 'measured_at', future_hours.strftime('%Y-%m-%dT%H:%M:%S.000Z'))
-    
-    print(f"✅ Hourly: {hourly_sub.shape}")
+
+    print(f"✅ Hourly predictions generated: {hourly_sub.shape}")
     
     # ==================
     # 8. MONTHLY FORECAST (12 months)
