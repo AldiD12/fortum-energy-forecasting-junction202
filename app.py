@@ -6,7 +6,6 @@ Forecasts consumption for 112 customer groups
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-import xgboost as xgb
 import requests
 import holidays
 from sklearn.metrics import mean_absolute_percentage_error
@@ -363,7 +362,7 @@ def main():
 
     print(f"Train (90%): {len(X_train):,} | Test (10%): {len(X_test):,}")
     
-    # Train ENSEMBLE models for different customer types (WINNING STRATEGY!)
+    # Train LightGBM models for different customer types (OPTIMIZED FOR SPEED!)
     models = {}
 
     # Store all predictions for proper MAPE calculation
@@ -372,7 +371,7 @@ def main():
 
     for customer_type in df_groups['customer_type'].unique():
         print(f"\n{'='*50}")
-        print(f"Training ENSEMBLE for {customer_type}...")
+        print(f"Training LightGBM for {customer_type}...")
         print(f"{'='*50}")
 
         type_groups = df_groups[df_groups['customer_type'] == customer_type]['region_id'].tolist()
@@ -388,7 +387,7 @@ def main():
         X_type_test = type_data.iloc[type_split:][feature_cols]
         y_type_test = type_data.iloc[type_split:]['consumption']
 
-        # --- MODEL 1: LightGBM ---
+        # LightGBM Model
         print(f"  Training LightGBM...")
         lgb_params = {
             'objective': 'regression',
@@ -407,69 +406,31 @@ def main():
         lgb_train = lgb.Dataset(X_type_train, y_type_train)
         lgb_eval = lgb.Dataset(X_type_test, y_type_test, reference=lgb_train)
 
-        lgb_model = lgb.train(
+        model = lgb.train(
             lgb_params, lgb_train, num_boost_round=500,
             valid_sets=[lgb_eval],
             callbacks=[lgb.early_stopping(50, verbose=False)]
         )
 
-        # --- MODEL 2: XGBoost ---
-        print(f"  Training XGBoost...")
-        xgb_params = {
-            'objective': 'reg:squarederror',
-            'eval_metric': 'mape',
-            'max_depth': 6,
-            'learning_rate': 0.03,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 0.1,
-            'reg_lambda': 0.1,
-            'verbosity': 0
-        }
+        # Store model
+        models[customer_type] = model
 
-        xgb_train = xgb.DMatrix(X_type_train, label=y_type_train)
-        xgb_eval = xgb.DMatrix(X_type_test, label=y_type_test)
+        # Calculate MAPE (filter zeros to avoid NaN)
+        pred = model.predict(X_type_test)
 
-        xgb_model = xgb.train(
-            xgb_params, xgb_train, num_boost_round=500,
-            evals=[(xgb_eval, 'eval')],
-            early_stopping_rounds=50,
-            verbose_eval=False
-        )
-
-        # Store both models as ensemble
-        models[customer_type] = {
-            'lgb': lgb_model,
-            'xgb': xgb_model
-        }
-
-        # Calculate ensemble predictions (weighted average)
-        lgb_pred = lgb_model.predict(X_type_test)
-        xgb_pred = xgb_model.predict(xgb.DMatrix(X_type_test))
-
-        # Ensemble: 60% LightGBM + 40% XGBoost (LightGBM typically performs better on this data)
-        ensemble_pred = 0.6 * lgb_pred + 0.4 * xgb_pred
-
-        # Calculate MAPE for ensemble (filter zeros to avoid NaN)
         mask = y_type_test > 0.01
         y_test_filtered = y_type_test[mask]
-        lgb_pred_filtered = lgb_pred[mask]
-        xgb_pred_filtered = xgb_pred[mask]
-        ensemble_pred_filtered = ensemble_pred[mask]
+        pred_filtered = pred[mask]
 
         if len(y_test_filtered) > 0:
-            lgb_mape = np.mean(np.abs((y_test_filtered - lgb_pred_filtered) / y_test_filtered)) * 100
-            xgb_mape = np.mean(np.abs((y_test_filtered - xgb_pred_filtered) / y_test_filtered)) * 100
-            ensemble_mape = np.mean(np.abs((y_test_filtered - ensemble_pred_filtered) / y_test_filtered)) * 100
+            mape = np.mean(np.abs((y_test_filtered - pred_filtered) / y_test_filtered)) * 100
         else:
-            lgb_mape = xgb_mape = ensemble_mape = 0.0
+            mape = 0.0
 
-        print(f"  LightGBM MAPE: {lgb_mape:.2f}%")
-        print(f"  XGBoost MAPE: {xgb_mape:.2f}%")
-        print(f"  ✅ Ensemble MAPE: {ensemble_mape:.2f}%")
+        print(f"  ✅ LightGBM MAPE: {mape:.2f}%")
 
-        # Store ensemble predictions for overall MAPE calculation
-        all_test_preds.extend(ensemble_pred.tolist())
+        # Store predictions for overall MAPE calculation
+        all_test_preds.extend(pred.tolist())
         all_test_actuals.extend(y_type_test.tolist())
 
     # Calculate OVERALL MAPE correctly (weighted by all customer types)
@@ -545,16 +506,12 @@ def main():
 
         customer_type = group_info['customer_type'].iloc[0]
 
-        # Use appropriate ensemble models
+        # Use appropriate model
         if customer_type in models:
-            ensemble = models[customer_type]
-            lgb_model = ensemble['lgb']
-            xgb_model = ensemble['xgb']
+            model = models[customer_type]
         else:
-            # Fallback to first available ensemble
-            ensemble = list(models.values())[0]
-            lgb_model = ensemble['lgb']
-            xgb_model = ensemble['xgb']
+            # Fallback to first available model
+            model = list(models.values())[0]
 
         # Get last values for this group
         last_vals = df_long[df_long['group_id'] == group_id].tail(200)
@@ -599,12 +556,8 @@ def main():
                 if col not in hour_features.columns:
                     hour_features[col] = 0
 
-            # Predict for this hour using ENSEMBLE
-            lgb_pred = lgb_model.predict(hour_features[feature_cols])[0]
-            xgb_pred = xgb_model.predict(xgb.DMatrix(hour_features[feature_cols]))[0]
-
-            # Ensemble: 60% LightGBM + 40% XGBoost
-            pred = 0.6 * lgb_pred + 0.4 * xgb_pred
+            # Predict for this hour using LightGBM
+            pred = model.predict(hour_features[feature_cols])[0]
             group_predictions.append(pred)
 
             # UPDATE HISTORY with prediction for next iteration
