@@ -1,0 +1,15 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+lightgbm
+joblib
+pdfplumber
+python-dateutil
+streamlit
+fastapi
+uvicorn
+pydantic
+plotly
+holidays
+openpyxl
