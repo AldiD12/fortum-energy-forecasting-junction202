@@ -495,9 +495,11 @@ def main():
     hourly_preds = {}
 
     print(f"Generating predictions for {len(CUSTOMER_GROUPS)} customer groups...")
+
     for idx, group_id in enumerate(CUSTOMER_GROUPS):
         if (idx + 1) % 20 == 0 or (idx + 1) == len(CUSTOMER_GROUPS):
             print(f"  Progress: {idx + 1}/{len(CUSTOMER_GROUPS)} groups completed...")
+
         # Get customer type for this group
         group_info = df_groups[df_groups['region_id'] == group_id]
         if group_info.empty:
@@ -520,44 +522,53 @@ def main():
             hourly_preds[str(group_id)] = [1000] * 48
             continue
 
+        # PRE-CALCULATE group features once (MUCH FASTER!)
+        group_features_template = {}
+        if not group_info.empty:
+            for col in ['customer_type', 'contract_type', 'consumption_level']:
+                if col in group_info.columns:
+                    val = group_info[col].values[0]
+                    # Pre-calculate all dummy features for this group
+                    for cat in df_long[col].unique():
+                        if cat != val:  # drop_first
+                            group_features_template[f'{col}_{cat}'] = 0
+                        else:
+                            if f'{col}_{cat}' in feature_cols:
+                                group_features_template[f'{col}_{cat}'] = 1
+
         # AUTOREGRESSIVE PREDICTION - Update lags dynamically
         group_predictions = []
         history = last_vals['consumption'].tolist()  # Keep history for lag calculations
 
-        for hour_idx in range(48):
-            # Create features for THIS SPECIFIC HOUR
-            hour_features = future_df.iloc[hour_idx:hour_idx+1].copy()
+        # Prepare lag periods once
+        lag_periods = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]
+        window_periods = [24, 48, 168]
 
-            # Add group features
-            if not group_info.empty:
-                for col in ['customer_type', 'contract_type', 'consumption_level']:
-                    if col in group_info.columns:
-                        val = group_info[col].values[0]
-                        # Add dummy features
-                        for cat in df_long[col].unique():
-                            if cat != val:  # drop_first
-                                hour_features[f'{col}_{cat}'] = 0
-                            else:
-                                if f'{col}_{cat}' in feature_cols:
-                                    hour_features[f'{col}_{cat}'] = 1
+        for hour_idx in range(48):
+            # Start with future weather/time features for this hour
+            hour_features = future_df.iloc[hour_idx].to_dict()
+
+            # Add pre-calculated group features (FAST!)
+            hour_features.update(group_features_template)
 
             # DYNAMIC LAG UPDATES - Use most recent history including predictions
-            # Extended lags: 1, 2, 3, 6, 12, 24, 48, 72, 168, 336
-            lag_periods = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]
             for lag in lag_periods:
                 hour_features[f'lag_{lag}'] = history[-lag] if len(history) >= lag else last_vals['consumption'].mean()
 
             # Rolling windows
-            for window in [24, 48, 168]:
+            for window in window_periods:
                 hour_features[f'roll_{window}'] = np.mean(history[-window:]) if len(history) >= window else last_vals['consumption'].mean()
 
-            # Fill missing features
+            # Fill any remaining missing features with 0
             for col in feature_cols:
-                if col not in hour_features.columns:
+                if col not in hour_features:
                     hour_features[col] = 0
 
+            # Create feature array in correct order
+            feature_array = [hour_features[col] for col in feature_cols]
+
             # Predict for this hour using LightGBM
-            pred = model.predict(hour_features[feature_cols])[0]
+            pred = model.predict([feature_array])[0]
             group_predictions.append(pred)
 
             # UPDATE HISTORY with prediction for next iteration
