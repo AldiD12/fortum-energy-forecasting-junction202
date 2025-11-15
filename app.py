@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 CONFIG = {
-    'combined_data': 'combined_data.csv',  # Combined weather + consumption + price data
+    'combined_data': 'CombinedData.xlsx',  # Combined weather + consumption + price data
     'train_file': '20251111_JUNCTION_training.xlsx',  # Still need for groups metadata
     'sheet_groups': 'groups',
     'output_hourly': 'submission_hourly.csv',
@@ -212,7 +212,7 @@ def main():
     print_section("LOADING COMBINED DATA")
 
     # Load combined CSV with all data
-    df = pd.read_csv(CONFIG['combined_data'])
+    df = pd.read_excel(CONFIG["combined_data"])
 
     # Rename columns to standardized names
     column_mapping = {
@@ -236,7 +236,7 @@ def main():
     print(f"   Date range: {df['measured_at'].min()} to {df['measured_at'].max()}")
     print(f"   Weather features: avg_temp, max_temp, min_temp, humidity, wind_speed, wind_direction, precipitation, air_pressure")
     print(f"   Price feature: eur_per_mwh")
-    print(f"   Customer groups: {len([c for c in df.columns if c.isdigit()])}")
+    print(f"   Customer groups: {len([c for c in df.columns if str(c).isdigit()])}")
 
     # Load customer group metadata
     df_groups = pd.read_excel(CONFIG['train_file'], sheet_name=CONFIG['sheet_groups'])
@@ -254,7 +254,30 @@ def main():
     print("✅ Price features created (ma_24, volatility, trend, ma_168)")
     
     # ==================
-    # 3. FEATURES
+    # 3. DATA TYPE CONVERSION
+    # ==================
+    print("Converting data types...")
+    
+    # Convert temperature columns to numeric
+    temp_cols = ['avg_temp', 'max_temp', 'min_temp']
+    for col in temp_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Convert other numeric columns
+    numeric_cols = ['humidity', 'wind_speed', 'wind_direction', 'precipitation', 'air_pressure', 'eur_per_mwh']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Convert customer group columns to numeric
+    for col in df.columns:
+        if str(col).isdigit():
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    print("✅ Data types converted")
+    
+    # 4. FEATURE ENGINEERING
     # ==================
     print_section("FEATURE ENGINEERING")
     df = create_features(df)
